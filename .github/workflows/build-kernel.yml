@@ -1,0 +1,203 @@
+name: CI - Build kernel (AnyKernel3) - Documentation compliant
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  DEVICE: viva
+  DEFCONFIG: viva_defconfig
+  KERNEL_DIR: ${{ github.workspace }}
+  OUT_DIR: ${{ github.workspace }}/out
+  ANYKERNEL_DIR: ${{ github.workspace }}/AnyKernel3
+  LOG_FILE: ${{ github.workspace }}/build_log_${{ env.DEVICE }}_${{ github.run_id }}.txt
+  JOBS: 8
+  ARCH: arm64
+  VERBOSE: 0   # set to 1 to enable V=1 verbose kernel build
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Show runner info
+      run: |
+        uname -a
+        lscpu
+        free -h
+
+    - name: Prepare directories and env sanity
+      shell: bash
+      run: |
+        set -euo pipefail
+        mkdir -p "${OUT_DIR}"
+        mkdir -p "${OUT_DIR}/modules_install"
+        echo "KERNEL_DIR=${KERNEL_DIR}"
+        echo "OUT_DIR=${OUT_DIR}"
+        echo "ANYKERNEL_DIR=${ANYKERNEL_DIR}"
+        echo "LOG_FILE=${LOG_FILE}"
+        echo "JOBS=${JOBS}"
+        env | grep -E 'ARCH|OUT_DIR|KERNEL_DIR|DEFCONFIG|DEVICE|VERBOSE' || true
+
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends build-essential bc ccache libncurses5-dev libssl-dev flex bison git unzip zip \
+          gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi rsync
+        sudo apt-get clean
+
+    - name: Configure ccache
+      shell: bash
+      run: |
+        mkdir -p ~/.ccache
+        export CCACHE_DIR=~/.ccache
+        ccache -M 5G || true
+        ccache -s || true
+
+    - name: Export build variables for steps
+      shell: bash
+      run: |
+        echo "ARCH=${ARCH}" >> $GITHUB_ENV
+        echo "OUT_DIR=${OUT_DIR}" >> $GITHUB_ENV
+        echo "KERNEL_DIR=${KERNEL_DIR}" >> $GITHUB_ENV
+        echo "DEFCONFIG=${DEFCONFIG}" >> $GITHUB_ENV
+        echo "DEVICE=${DEVICE}" >> $GITHUB_ENV
+        echo "ANYKERNEL_DIR=${ANYKERNEL_DIR}" >> $GITHUB_ENV
+        echo "LOG_FILE=${LOG_FILE}" >> $GITHUB_ENV
+        echo "JOBS=${JOBS}" >> $GITHUB_ENV
+        echo "VERBOSE=${VERBOSE}" >> $GITHUB_ENV
+
+    - name: Validate DEFCONFIG presence
+      working-directory: ${{ env.KERNEL_DIR }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Prefer arch/ARCH/configs/<DEFCONFIG>, fallback to top-level <DEFCONFIG>
+        if [ -f "arch/${ARCH}/configs/${DEFCONFIG}" ]; then
+          echo "Found defconfig at arch/${ARCH}/configs/${DEFCONFIG}"
+        elif [ -f "${DEFCONFIG}" ]; then
+          echo "Found defconfig at repo root: ${DEFCONFIG}"
+        else
+          echo "ERROR: DEFCONFIG ${DEFCONFIG} not found in arch/${ARCH}/configs or repo root"
+          ls -la arch/${ARCH}/configs || true
+          exit 1
+        fi
+
+    - name: Kernel: make defconfig / oldconfig (documented procedure)
+      working-directory: ${{ env.KERNEL_DIR }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Always use same O=OUT_DIR for config and build to respect README requirement
+        if [ "${VERBOSE}" = "1" ]; then VFLAG="V=1"; else VFLAG=""; fi
+        make O="${OUT_DIR}" ARCH=${ARCH} ${DEFCONFIG} 2>&1 | tee "${LOG_FILE}"
+        # Run oldconfig non-interactive to ensure no missing symbols; fall back to olddefconfig if available
+        if command -v yes >/dev/null 2>&1; then
+          yes "" | make O="${OUT_DIR}" ARCH=${ARCH} oldconfig 2>&1 | tee -a "${LOG_FILE}" || true
+        else
+          make O="${OUT_DIR}" ARCH=${ARCH} olddefconfig 2>&1 | tee -a "${LOG_FILE}" || true
+        fi
+
+    - name: Kernel: build Image and modules
+      working-directory: ${{ env.KERNEL_DIR }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "${VERBOSE}" = "1" ]; then VFLAG="V=1"; else VFLAG=""; fi
+        # Build kernel and modules; use O= to keep output outside source tree
+        make -j${JOBS} O="${OUT_DIR}" ARCH=${ARCH} ${VFLAG} 2>&1 | tee -a "${LOG_FILE}"
+
+    - name: Kernel: modules_install to OUT_DIR/modules_install (avoid touching root)
+      working-directory: ${{ env.KERNEL_DIR }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        # Install modules into a staging dir within OUT_DIR; README mandates not to pollute system
+        make O="${OUT_DIR}" ARCH=${ARCH} INSTALL_MOD_PATH="${OUT_DIR}/modules_install" modules_install 2>&1 | tee -a "${LOG_FILE}"
+        echo "Modules installed to ${OUT_DIR}/modules_install"
+
+    - name: Collect kernel build artifacts (images, dtbs, modules)
+      shell: bash
+      run: |
+        set -euo pipefail
+        ART="${OUT_DIR}/artifacts"
+        mkdir -p "${ART}"
+        # Common possible outputs: Image, Image.gz, zImage, Image.gz-dtb, Image.lz, dtbs/*.dtb, arch/arm64/boot/dts/vendor/*.dtb
+        # Copy kernel images
+        find "${OUT_DIR}" -maxdepth 3 -type f \( -name 'Image*' -o -name 'zImage' -o -name '*.img' -o -name '*.lz' \) -print -exec cp -v {} "${ART}/" \; || true
+        # Copy dtbs
+        find "${OUT_DIR}" -type f -name '*.dtb' -print -exec cp -v {} "${ART}/" \; || true
+        # Copy System modules tarball (create a tar for modules to include in package if needed)
+        if [ -d "${OUT_DIR}/modules_install" ]; then
+          pushd "${OUT_DIR}/modules_install" > /dev/null
+          tar -czf "${ART}/modules_${DEVICE}.tar.gz" . || true
+          popd > /dev/null
+        fi
+        ls -la "${ART}"
+
+    - name: Prepare AnyKernel3 package
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ ! -d "${ANYKERNEL_DIR}" ]; then
+          echo "ERROR: AnyKernel3 folder not found at ${ANYKERNEL_DIR}"
+          exit 1
+        fi
+        AK_TMP="${OUT_DIR}/anykernel_package"
+        rm -rf "${AK_TMP}"
+        cp -r "${ANYKERNEL_DIR}" "${AK_TMP}"
+        # Copy selected artifacts into AnyKernel root. Choose preferred kernel image names first.
+        ART="${OUT_DIR}/artifacts"
+        # Prioritise Image.gz-dtb -> Image.gz -> Image -> zImage
+        if compgen -G "${ART}/Image.gz-dtb" > /dev/null; then
+          cp -v "${ART}/Image.gz-dtb" "${AK_TMP}/Image.gz-dtb"
+        elif compgen -G "${ART}/Image.gz" > /dev/null; then
+          cp -v "${ART}/Image.gz" "${AK_TMP}/Image.gz"
+        elif compgen -G "${ART}/Image" > /dev/null; then
+          cp -v "${ART}/Image" "${AK_TMP}/Image"
+        elif compgen -G "${ART}/zImage" > /dev/null; then
+          cp -v "${ART}/zImage" "${AK_TMP}/zImage"
+        else
+          echo "Warning: no kernel Image found in ${ART}. Listing artifacts:"
+          ls -la "${ART}"
+        fi
+        # Copy dtbs if any and modules tar if exists
+        compgen -G "${ART}/*.dtb" > /dev/null && cp -v ${ART}/*.dtb "${AK_TMP}/" || true
+        [ -f "${ART}/modules_${DEVICE}.tar.gz" ] && cp -v "${ART}/modules_${DEVICE}.tar.gz" "${AK_TMP}/" || true
+
+    - name: Create AnyKernel3 flashable ZIP
+      shell: bash
+      run: |
+        set -euo pipefail
+        PKG="vivakernel-${{ env.DEVICE }}-run${{ github.run_number }}.zip"
+        pushd "${OUT_DIR}/anykernel_package" > /dev/null
+        # Exclude git metadata, large build dirs
+        zip -r "../${PKG}" . -x "**/.git/**" -x "**/README.md" -x "**/.github/**"
+        popd > /dev/null
+        mkdir -p "${OUT_DIR}/artifacts"
+        mv "${OUT_DIR}/${PKG}" "${OUT_DIR}/artifacts/" || true
+        echo "Created package: ${OUT_DIR}/artifacts/${PKG}"
+        ls -la "${OUT_DIR}/artifacts"
+
+    - name: Upload artifacts (logs, zip, modules)
+      uses: actions/upload-artifact@v4
+      with:
+        name: kernel-build-${{ env.DEVICE }}-${{ github.run_number }}
+        path: |
+          ${{ env.OUT_DIR }}/artifacts/
+          ${{ env.LOG_FILE }}
+
+    - name: ccache stats
+      shell: bash
+      run: |
+        ccache -s || true
