@@ -1,46 +1,56 @@
-- name: Load env file into GITHUB_ENV
-  run: |
-    set -euo pipefail
-    CANDIDATES=(
-      "$HOME/.kernel.env"
-      ".github/workflows/envs/kernel.env"
-      ".github/workflows/kernel.env"
-      "kernel.env"
-    )
-    FOUND=""
-    echo "Searching for env file..."
-    for p in "${CANDIDATES[@]}"; do
-      echo " - checking $p"
-      if [ -f "$p" ]; then
-        FOUND="$p"
-        break
-      fi
-    done
-    if [ -z "$FOUND" ]; then
-      echo "Env file not found in any candidate path"
-      echo "Listing .github/workflows:"
-      ls -la .github/workflows || true
-      echo "Listing repo root:"
-      ls -la . || true
-      exit 1
-    fi
-    echo "Using env file: $FOUND"
-    while IFS= read -r line || [ -n "$line" ]; do
-      case "$line" in
-        ''|\#*) continue ;;
-      esac
-      name="${line%%=*}"
-      value="${line#*=}"
-      expanded="$(eval "echo \"$value\"")"
-      echo "${name}=${expanded}" >> "$GITHUB_ENV"
-    done < "$FOUND"
-    echo "KERNEL_DIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
-    if [ -z "${OUT_DIR:-}" ]; then
-      echo "OUT_DIR=${GITHUB_WORKSPACE}/out" >> "$GITHUB_ENV"
-    else
-      echo "OUT_DIR=${GITHUB_WORKSPACE}/${OUT_DIR}" >> "$GITHUB_ENV"
-    fi
-    echo "ANYKERNEL_DIR=${GITHUB_WORKSPACE}/${ANYKERNEL_DIR:-AnyKernel3}" >> "$GITHUB_ENV"
-    TS=$(date +%Y%m%d_%H%M%S)
-    LOG_PREFIX=${LOG_PREFIX:-build_log_${DEVICE:-kernel}}
-    echo "LOG_FILE=${GITHUB_WORKSPACE}/${LOG_PREFIX}_${TS}.txt" >> "$GITHUB_ENV"
+name: CI Build Kernel - load env from vivar/kernel.env
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  validate-and-load-env:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Load env from vivar/kernel.env
+        run: |
+          set -euo pipefail
+          ENV_FILE="vivar/kernel.env"
+          echo "Checking for env file at: $ENV_FILE"
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "Env file not found: $ENV_FILE"
+            echo "Listing repository root:"
+            ls -la || true
+            exit 1
+          fi
+          echo "Using env file: $ENV_FILE"
+          while IFS= read -r line || [ -n "$line" ]; do
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            name="${line%%=*}"
+            value="${line#*=}"
+            expanded="$(eval "echo \"$value\"")"
+            echo "${name}=${expanded}" >> "$GITHUB_ENV"
+          done < "$ENV_FILE"
+          echo "KERNEL_DIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+          if [ -z "${OUT_DIR:-}" ]; then
+            echo "OUT_DIR=${GITHUB_WORKSPACE}/out" >> "$GITHUB_ENV"
+          else
+            echo "OUT_DIR=${GITHUB_WORKSPACE}/${OUT_DIR}" >> "$GITHUB_ENV"
+          fi
+          TS=$(date +%Y%m%d_%H%M%S)
+          LOG_PREFIX=${LOG_PREFIX:-build_log_${DEVICE:-kernel}}
+          echo "LOG_FILE=${GITHUB_WORKSPACE}/${LOG_PREFIX}_${TS}.txt" >> "$GITHUB_ENV"
+
+      - name: Show loaded env (sanity)
+        run: |
+          set -euo pipefail
+          echo "DEVICE=${DEVICE:-<unset>}"
+          echo "DEFCONFIG=${DEFCONFIG:-<unset>}"
+          echo "OUT_DIR=${OUT_DIR:-<unset>}"
+          echo "ANYKERNEL_DIR=${ANYKERNEL_DIR:-<unset>}"
+          echo "JOBS=${JOBS:-<unset>}"
+          echo "ARCH=${ARCH:-<unset>}"
+          echo "VERBOSE=${VERBOSE:-<unset>}"
+          echo "LOG_FILE=${LOG_FILE:-<unset>}"
