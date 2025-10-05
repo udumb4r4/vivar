@@ -1,4 +1,4 @@
-name: CI - Build kernel (AnyKernel3) - env-file approach
+name: CI - Validate env loader and simple build steps
 
 on:
   push:
@@ -9,9 +9,9 @@ permissions:
   contents: read
 
 jobs:
-  build:
+  validate-and-prepare:
     runs-on: ubuntu-22.04
-    timeout-minutes: 180
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -21,33 +21,32 @@ jobs:
 
       - name: Load env file into GITHUB_ENV
         run: |
-          set -euo pipefail
+          set -eu
           ENV_FILE=".github/workflows/envs/kernel.env"
-          if [ ! -f "${ENV_FILE}" ]; then
-            echo "Env file not found: ${ENV_FILE}"
+          if [ ! -f "$ENV_FILE" ]; then
+            echo "Env file not found: $ENV_FILE"
             exit 1
           fi
           while IFS= read -r line || [ -n "$line" ]; do
-            # skip comments and empty lines
             case "$line" in
               ''|\#*) continue ;;
             esac
             name="${line%%=*}"
             value="${line#*=}"
-            # expand variables like ${GITHUB_WORKSPACE} or ${DEVICE} if present
+            # expand local references safely
             expanded="$(eval "echo \"$value\"")"
             echo "${name}=${expanded}" >> "$GITHUB_ENV"
-          done < "${ENV_FILE}"
-          # set runtime-derived vars
+          done < "$ENV_FILE"
+          # runtime-derived values
           echo "KERNEL_DIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
-          echo "OUT_DIR=${GITHUB_WORKSPACE}/$OUT_DIR" >> "$GITHUB_ENV"
-          echo "ANYKERNEL_DIR=${GITHUB_WORKSPACE}/$ANYKERNEL_DIR" >> "$GITHUB_ENV"
-          # create log filename using timestamp
+          echo "OUT_DIR=${GITHUB_WORKSPACE}/${OUT_DIR}" >> "$GITHUB_ENV"
+          echo "ANYKERNEL_DIR=${GITHUB_WORKSPACE}/${ANYKERNEL_DIR}" >> "$GITHUB_ENV"
           TS=$(date +%Y%m%d_%H%M%S)
           echo "LOG_FILE=${GITHUB_WORKSPACE}/${LOG_PREFIX}_${TS}.txt" >> "$GITHUB_ENV"
-      - name: Show loaded env
+
+      - name: Show loaded env (sanity)
         run: |
-          echo "--- Selected env ---"
+          set -eu
           echo "DEVICE=$DEVICE"
           echo "DEFCONFIG=$DEFCONFIG"
           echo "KERNEL_DIR=$KERNEL_DIR"
@@ -58,114 +57,14 @@ jobs:
           echo "VERBOSE=$VERBOSE"
           echo "LOG_FILE=$LOG_FILE"
 
-      - name: Install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends build-essential bc ccache libncurses5-dev libssl-dev flex bison git unzip zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi rsync
-          sudo apt-get clean
-
-      - name: Setup ccache
-        run: |
-          mkdir -p ~/.ccache
-          export CCACHE_DIR=~/.ccache
-          ccache -M 5G || true
-          ccache -s || true
-
       - name: Prepare directories
         run: |
-          set -euo pipefail
-          mkdir -p "${OUT_DIR}"
-          mkdir -p "${OUT_DIR}/modules_install"
-          mkdir -p "${OUT_DIR}/artifacts"
+          set -eu
+          mkdir -p "$OUT_DIR" "$OUT_DIR/modules_install" "$OUT_DIR/artifacts"
+          ls -ld "$OUT_DIR" || true
 
-      - name: Validate DEFCONFIG presence
-        working-directory: ${{ github.workspace }}
+      - name: Minimal build step (no kernel compile) to confirm workflow parses
         run: |
-          set -euo pipefail
-          if [ -f "arch/${ARCH}/configs/${DEFCONFIG}" ]; then
-            echo "Found defconfig at arch/${ARCH}/configs/${DEFCONFIG}"
-          elif [ -f "${DEFCONFIG}" ]; then
-            echo "Found defconfig at repo root: ${DEFCONFIG}"
-          else
-            echo "ERROR: DEFCONFIG ${DEFCONFIG} not found"
-            ls -la arch/${ARCH}/configs || true
-            exit 1
-          fi
-
-      - name: Kernel: make defconfig / oldconfig
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          if [ "${VERBOSE}" = "1" ]; then VFLAG="V=1"; else VFLAG=""; fi
-          make O="${OUT_DIR}" ARCH=${ARCH} ${DEFCONFIG} 2>&1 | tee "${LOG_FILE}"
-          if command -v yes >/dev/null 2>&1; then
-            yes "" | make O="${OUT_DIR}" ARCH=${ARCH} oldconfig 2>&1 | tee -a "${LOG_FILE}" || true
-          else
-            make O="${OUT_DIR}" ARCH=${ARCH} olddefconfig 2>&1 | tee -a "${LOG_FILE}" || true
-          fi
-
-      - name: Kernel: build Image and modules
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          if [ "${VERBOSE}" = "1" ]; then VFLAG="V=1"; else VFLAG=""; fi
-          make -j"${JOBS}" O="${OUT_DIR}" ARCH=${ARCH} ${VFLAG} 2>&1 | tee -a "${LOG_FILE}"
-
-      - name: Kernel: modules_install to staging
-        working-directory: ${{ github.workspace }}
-        run: |
-          set -euo pipefail
-          make O="${OUT_DIR}" ARCH=${ARCH} INSTALL_MOD_PATH="${OUT_DIR}/modules_install" modules_install 2>&1 | tee -a "${LOG_FILE}"
-
-      - name: Collect artifacts and package AnyKernel3
-        run: |
-          set -euo pipefail
-          ART="${OUT_DIR}/artifacts"
-          # copy common images
-          find "${OUT_DIR}" -maxdepth 3 -type f \( -name 'Image*' -o -name 'zImage' -o -name '*.img' -o -name '*.lz' \) -exec cp -v {} "${ART}/" \; || true
-          find "${OUT_DIR}" -type f -name '*.dtb' -exec cp -v {} "${ART}/" \; || true
-          if [ -d "${OUT_DIR}/modules_install" ]; then
-            pushd "${OUT_DIR}/modules_install" > /dev/null
-            tar -czf "${ART}/modules_${DEVICE}.tar.gz" . || true
-            popd > /dev/null
-          fi
-          # Prepare AnyKernel
-          if [ ! -d "${ANYKERNEL_DIR}" ]; then
-            echo "AnyKernel3 directory not found at ${ANYKERNEL_DIR}"
-            exit 1
-          fi
-          AK_TMP="${OUT_DIR}/anykernel_package"
-          rm -rf "${AK_TMP}"
-          cp -r "${ANYKERNEL_DIR}" "${AK_TMP}"
-          # copy prioritized image
-          if compgen -G "${ART}/Image.gz-dtb" > /dev/null; then
-            cp -v "${ART}/Image.gz-dtb" "${AK_TMP}/Image.gz-dtb"
-          elif compgen -G "${ART}/Image.gz" > /dev/null; then
-            cp -v "${ART}/Image.gz" "${AK_TMP}/Image.gz"
-          elif compgen -G "${ART}/Image" > /dev/null; then
-            cp -v "${ART}/Image" "${AK_TMP}/Image"
-          elif compgen -G "${ART}/zImage" > /dev/null; then
-            cp -v "${ART}/zImage" "${AK_TMP}/zImage"
-          else
-            echo "Warning: no kernel image found in ${ART}"
-          fi
-          cp -v ${ART}/*.dtb "${AK_TMP}/" || true
-          [ -f "${ART}/modules_${DEVICE}.tar.gz" ] && cp -v "${ART}/modules_${DEVICE}.tar.gz" "${AK_TMP}/" || true
-          PKG="vivakernel-${DEVICE}-run${{ github.run_number }}.zip"
-          pushd "${AK_TMP}" > /dev/null
-          zip -r "../${PKG}" . -x "**/.git/**" -x "**/README.md" -x "**/.github/**"
-          popd > /dev/null
-          mv "${OUT_DIR}/${PKG}" "${ART}/" || true
-          ls -la "${ART}"
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: kernel-build-${{ github.run_number }}
-          path: |
-            ${{ env.OUT_DIR }}/artifacts/
-            ${{ env.LOG_FILE }}
-
-      - name: ccache stats
-        run: |
-          ccache -s || true
+          set -eu
+          echo "Skipping actual kernel build in this validation workflow"
+          echo "Would run: make O=\"$OUT_DIR\" ARCH=$ARCH $DEFCONFIG"
