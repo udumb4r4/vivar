@@ -6,14 +6,14 @@ on:
   workflow_dispatch:
 
 env:
-  DEVICE: "viva"
-  DEFCONFIG: "viva_defconfig"
-  KERNEL_DIR: "${{ github.workspace }}"
-  OUT_DIR: "${{ github.workspace }}/out"
-  ANYKERNEL_DIR: "${{ github.workspace }}/AnyKernel3"
-  LOG_FILE: "${{ github.workspace }}/build_log_${{ github.run_id }}.txt"
-  JOBS: "8"
-  ARCH: "arm64"
+  DEVICE: viva
+  DEFCONFIG: viva_defconfig
+  KERNEL_DIR: ${{ github.workspace }}
+  OUT_DIR: ${{ github.workspace }}/out
+  ANYKERNEL_DIR: ${{ github.workspace }}/AnyKernel3
+  LOG_FILE: ${{ github.workspace }}/build_log_${{ github.run_id }}.txt
+  JOBS: 8
+  ARCH: arm64
   VERBOSE: "0"
 
 permissions:
