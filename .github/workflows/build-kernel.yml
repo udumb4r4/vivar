@@ -1,20 +1,9 @@
-name: CI - Build kernel (AnyKernel3) - Documentation compliant
+name: CI - Build kernel (AnyKernel3) - env-file approach
 
 on:
   push:
     branches: [ main ]
   workflow_dispatch:
-
-env:
-  DEVICE: viva
-  DEFCONFIG: viva_defconfig
-  KERNEL_DIR: ${{ github.workspace }}
-  OUT_DIR: ${{ github.workspace }}/out
-  ANYKERNEL_DIR: ${{ github.workspace }}/AnyKernel3
-  LOG_FILE: ${{ github.workspace }}/build_log_${{ github.run_id }}.txt
-  JOBS: 8
-  ARCH: arm64
-  VERBOSE: "0"
 
 permissions:
   contents: read
@@ -30,23 +19,44 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Show runner info
-        run: |
-          uname -a
-          lscpu
-          free -h
-
-      - name: Prepare directories and env sanity
+      - name: Load env file into GITHUB_ENV
         run: |
           set -euo pipefail
-          mkdir -p "${OUT_DIR}"
-          mkdir -p "${OUT_DIR}/modules_install"
-          echo "KERNEL_DIR=${KERNEL_DIR}"
-          echo "OUT_DIR=${OUT_DIR}"
-          echo "ANYKERNEL_DIR=${ANYKERNEL_DIR}"
-          echo "LOG_FILE=${LOG_FILE}"
-          echo "JOBS=${JOBS}"
-          env | grep -E 'ARCH|OUT_DIR|KERNEL_DIR|DEFCONFIG|DEVICE|VERBOSE' || true
+          ENV_FILE=".github/workflows/envs/kernel.env"
+          if [ ! -f "${ENV_FILE}" ]; then
+            echo "Env file not found: ${ENV_FILE}"
+            exit 1
+          fi
+          while IFS= read -r line || [ -n "$line" ]; do
+            # skip comments and empty lines
+            case "$line" in
+              ''|\#*) continue ;;
+            esac
+            name="${line%%=*}"
+            value="${line#*=}"
+            # expand variables like ${GITHUB_WORKSPACE} or ${DEVICE} if present
+            expanded="$(eval "echo \"$value\"")"
+            echo "${name}=${expanded}" >> "$GITHUB_ENV"
+          done < "${ENV_FILE}"
+          # set runtime-derived vars
+          echo "KERNEL_DIR=${GITHUB_WORKSPACE}" >> "$GITHUB_ENV"
+          echo "OUT_DIR=${GITHUB_WORKSPACE}/$OUT_DIR" >> "$GITHUB_ENV"
+          echo "ANYKERNEL_DIR=${GITHUB_WORKSPACE}/$ANYKERNEL_DIR" >> "$GITHUB_ENV"
+          # create log filename using timestamp
+          TS=$(date +%Y%m%d_%H%M%S)
+          echo "LOG_FILE=${GITHUB_WORKSPACE}/${LOG_PREFIX}_${TS}.txt" >> "$GITHUB_ENV"
+      - name: Show loaded env
+        run: |
+          echo "--- Selected env ---"
+          echo "DEVICE=$DEVICE"
+          echo "DEFCONFIG=$DEFCONFIG"
+          echo "KERNEL_DIR=$KERNEL_DIR"
+          echo "OUT_DIR=$OUT_DIR"
+          echo "ANYKERNEL_DIR=$ANYKERNEL_DIR"
+          echo "JOBS=$JOBS"
+          echo "ARCH=$ARCH"
+          echo "VERBOSE=$VERBOSE"
+          echo "LOG_FILE=$LOG_FILE"
 
       - name: Install build dependencies
         run: |
@@ -54,27 +64,22 @@ jobs:
           sudo apt-get install -y --no-install-recommends build-essential bc ccache libncurses5-dev libssl-dev flex bison git unzip zip gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi rsync
           sudo apt-get clean
 
-      - name: Configure ccache
+      - name: Setup ccache
         run: |
           mkdir -p ~/.ccache
           export CCACHE_DIR=~/.ccache
           ccache -M 5G || true
           ccache -s || true
 
-      - name: Export build variables for steps
+      - name: Prepare directories
         run: |
-          echo "ARCH=${ARCH}" >> $GITHUB_ENV
-          echo "OUT_DIR=${OUT_DIR}" >> $GITHUB_ENV
-          echo "KERNEL_DIR=${KERNEL_DIR}" >> $GITHUB_ENV
-          echo "DEFCONFIG=${DEFCONFIG}" >> $GITHUB_ENV
-          echo "DEVICE=${DEVICE}" >> $GITHUB_ENV
-          echo "ANYKERNEL_DIR=${ANYKERNEL_DIR}" >> $GITHUB_ENV
-          echo "LOG_FILE=${LOG_FILE}" >> $GITHUB_ENV
-          echo "JOBS=${JOBS}" >> $GITHUB_ENV
-          echo "VERBOSE=${VERBOSE}" >> $GITHUB_ENV
+          set -euo pipefail
+          mkdir -p "${OUT_DIR}"
+          mkdir -p "${OUT_DIR}/modules_install"
+          mkdir -p "${OUT_DIR}/artifacts"
 
       - name: Validate DEFCONFIG presence
-        working-directory: ${{ env.KERNEL_DIR }}
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           if [ -f "arch/${ARCH}/configs/${DEFCONFIG}" ]; then
@@ -82,13 +87,13 @@ jobs:
           elif [ -f "${DEFCONFIG}" ]; then
             echo "Found defconfig at repo root: ${DEFCONFIG}"
           else
-            echo "ERROR: DEFCONFIG ${DEFCONFIG} not found in arch/${ARCH}/configs or repo root"
+            echo "ERROR: DEFCONFIG ${DEFCONFIG} not found"
             ls -la arch/${ARCH}/configs || true
             exit 1
           fi
 
       - name: Kernel: make defconfig / oldconfig
-        working-directory: ${{ env.KERNEL_DIR }}
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           if [ "${VERBOSE}" = "1" ]; then VFLAG="V=1"; else VFLAG=""; fi
@@ -100,44 +105,39 @@ jobs:
           fi
 
       - name: Kernel: build Image and modules
-        working-directory: ${{ env.KERNEL_DIR }}
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           if [ "${VERBOSE}" = "1" ]; then VFLAG="V=1"; else VFLAG=""; fi
           make -j"${JOBS}" O="${OUT_DIR}" ARCH=${ARCH} ${VFLAG} 2>&1 | tee -a "${LOG_FILE}"
 
-      - name: Kernel: modules_install to OUT_DIR/modules_install
-        working-directory: ${{ env.KERNEL_DIR }}
+      - name: Kernel: modules_install to staging
+        working-directory: ${{ github.workspace }}
         run: |
           set -euo pipefail
           make O="${OUT_DIR}" ARCH=${ARCH} INSTALL_MOD_PATH="${OUT_DIR}/modules_install" modules_install 2>&1 | tee -a "${LOG_FILE}"
-          echo "Modules installed to ${OUT_DIR}/modules_install"
 
-      - name: Collect kernel build artifacts
+      - name: Collect artifacts and package AnyKernel3
         run: |
           set -euo pipefail
           ART="${OUT_DIR}/artifacts"
-          mkdir -p "${ART}"
-          find "${OUT_DIR}" -maxdepth 3 -type f \( -name 'Image*' -o -name 'zImage' -o -name '*.img' -o -name '*.lz' \) -print -exec cp -v {} "${ART}/" \; || true
-          find "${OUT_DIR}" -type f -name '*.dtb' -print -exec cp -v {} "${ART}/" \; || true
+          # copy common images
+          find "${OUT_DIR}" -maxdepth 3 -type f \( -name 'Image*' -o -name 'zImage' -o -name '*.img' -o -name '*.lz' \) -exec cp -v {} "${ART}/" \; || true
+          find "${OUT_DIR}" -type f -name '*.dtb' -exec cp -v {} "${ART}/" \; || true
           if [ -d "${OUT_DIR}/modules_install" ]; then
             pushd "${OUT_DIR}/modules_install" > /dev/null
             tar -czf "${ART}/modules_${DEVICE}.tar.gz" . || true
             popd > /dev/null
           fi
-          ls -la "${ART}"
-
-      - name: Prepare AnyKernel3 package
-        run: |
-          set -euo pipefail
+          # Prepare AnyKernel
           if [ ! -d "${ANYKERNEL_DIR}" ]; then
-            echo "ERROR: AnyKernel3 folder not found at ${ANYKERNEL_DIR}"
+            echo "AnyKernel3 directory not found at ${ANYKERNEL_DIR}"
             exit 1
           fi
           AK_TMP="${OUT_DIR}/anykernel_package"
           rm -rf "${AK_TMP}"
           cp -r "${ANYKERNEL_DIR}" "${AK_TMP}"
-          ART="${OUT_DIR}/artifacts"
+          # copy prioritized image
           if compgen -G "${ART}/Image.gz-dtb" > /dev/null; then
             cp -v "${ART}/Image.gz-dtb" "${AK_TMP}/Image.gz-dtb"
           elif compgen -G "${ART}/Image.gz" > /dev/null; then
@@ -147,32 +147,21 @@ jobs:
           elif compgen -G "${ART}/zImage" > /dev/null; then
             cp -v "${ART}/zImage" "${AK_TMP}/zImage"
           else
-            echo "Warning: no kernel Image found in ${ART}"
-            ls -la "${ART}"
+            echo "Warning: no kernel image found in ${ART}"
           fi
-          if compgen -G "${ART}/*.dtb" > /dev/null; then
-            cp -v ${ART}/*.dtb "${AK_TMP}/" || true
-          fi
-          if [ -f "${ART}/modules_${DEVICE}.tar.gz" ]; then
-            cp -v "${ART}/modules_${DEVICE}.tar.gz" "${AK_TMP}/" || true
-          fi
-
-      - name: Create AnyKernel3 flashable ZIP
-        run: |
-          set -euo pipefail
+          cp -v ${ART}/*.dtb "${AK_TMP}/" || true
+          [ -f "${ART}/modules_${DEVICE}.tar.gz" ] && cp -v "${ART}/modules_${DEVICE}.tar.gz" "${AK_TMP}/" || true
           PKG="vivakernel-${DEVICE}-run${{ github.run_number }}.zip"
-          pushd "${OUT_DIR}/anykernel_package" > /dev/null
+          pushd "${AK_TMP}" > /dev/null
           zip -r "../${PKG}" . -x "**/.git/**" -x "**/README.md" -x "**/.github/**"
           popd > /dev/null
-          mkdir -p "${OUT_DIR}/artifacts"
-          mv "${OUT_DIR}/${PKG}" "${OUT_DIR}/artifacts/" || true
-          echo "Created package: ${OUT_DIR}/artifacts/${PKG}"
-          ls -la "${OUT_DIR}/artifacts"
+          mv "${OUT_DIR}/${PKG}" "${ART}/" || true
+          ls -la "${ART}"
 
-      - name: Upload artifacts (logs, zip, modules)
+      - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: kernel-build-${{ env.DEVICE }}-${{ github.run_number }}
+          name: kernel-build-${{ github.run_number }}
           path: |
             ${{ env.OUT_DIR }}/artifacts/
             ${{ env.LOG_FILE }}
